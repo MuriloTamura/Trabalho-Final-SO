@@ -25,7 +25,7 @@ CENARIOS = [
         "nome":        "Cenário 1 — Carga Padrão (8 processos, Q=4)",
         "n_processos": 8,
         "quantum":     4,
-        "seed":        31,
+        "seed":        41,
         "arquivo":     "cenario1.png",
     },
     {
@@ -86,7 +86,6 @@ def executar_cenario(cfg: dict):
 def main():
     print("╔══════════════════════════════════════════════════════════════════╗")
     print("║  Simulação: Escalonamento de CPU × Sistema de Arquivos          ║")
-    print("║  IFCE Campus Maracanaú — Sistemas Operacionais 2026.1           ║")
     print("╚══════════════════════════════════════════════════════════════════╝")
 
     todos_resultados = []
