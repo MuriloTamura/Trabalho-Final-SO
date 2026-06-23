@@ -42,6 +42,16 @@ CENARIOS = [
         "seed":        99,
         "arquivo":     "cenario3.png",
     },
+    {
+        # Carga com muitos processos e quantum pequeno: maximiza concorrência e
+        # preempção — o cenário que mais estresa o subsistema de E/S e revela
+        # melhor as diferenças entre políticas no sistema de arquivos.
+        "nome":        "Cenário 4 — Alta Concorrência + Quantum Pequeno (16 processos, Q=2)",
+        "n_processos": 16,
+        "quantum":     2,
+        "seed":        77,
+        "arquivo":     "cenario4.png",
+    },
 ]
 
 
@@ -89,12 +99,15 @@ def main():
     # ──────────────────────────────────────────
     separador("RESUMO — Melhor algoritmo por métrica em cada cenário")
     metricas_keys = [
-        ("tempo_medio_espera",  "Menor espera",        min),
-        ("tempo_medio_retorno", "Menor retorno",       min),
-        ("throughput",          "Maior throughput CPU",max),
-        ("latencia_media_io",   "Menor latência I/O",  min),
-        ("throughput_io_kb",    "Maior throughput I/O",max),
-        ("taxa_cache_hit",      "Maior cache hit",     max),
+        ("tempo_medio_espera",       "Menor espera",           min),
+        ("tempo_medio_retorno",      "Menor retorno",          min),
+        ("throughput",               "Maior throughput CPU",   max),
+        ("utilizacao_cpu",           "Maior utilização CPU",   max),
+        ("trocas_contexto",          "Menos trocas contexto",  min),
+        ("latencia_media_io",        "Menor latência I/O",     min),
+        ("throughput_io_kb",         "Maior throughput I/O",   max),
+        ("taxa_cache_hit",           "Maior cache hit",        max),
+        ("media_extents_por_arquivo","Menor fragmentação",     min),
     ]
 
     for nome_cenario, resultados in todos_resultados:

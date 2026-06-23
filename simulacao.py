@@ -167,6 +167,9 @@ class MetricasSistema:
     distancia_seek_total: int = 0
     media_extents_por_arquivo: float = 0.0  # indicador de fragmentação
     tempo_total_simulacao: int = 0
+    trocas_contexto: int = 0                # número de preempções / trocas de contexto
+    utilizacao_cpu: float = 0.0             # fração do tempo com CPU ocupada
+    historico_fila_io: List[int] = field(default_factory=list)  # tamanho da fila a cada tick
     starvation_detectado: bool = False
     processos_com_starvation: List[int] = field(default_factory=list)
     log_eventos: List[str] = field(default_factory=list)
@@ -400,6 +403,8 @@ def _motor_simulacao(processos: List[Processo], escalonador: "Escalonador",
     eventos: List[str] = []
     ticks_quantum = 0
     cpu_ociosa = 0
+    trocas_contexto = 0
+    historico_fila_io: List[int] = []
     agora = 0
     is_rr = isinstance(escalonador, EscalonadorRoundRobin)
 
@@ -422,6 +427,9 @@ def _motor_simulacao(processos: List[Processo], escalonador: "Escalonador",
             else:
                 prontos.append(proc)
 
+        # 2b) registra tamanho da fila de E/S neste tick
+        historico_fila_io.append(len(fs.fila) + (1 if fs.em_atendimento else 0))
+
         # 3) escolhe quem ocupa a CPU neste tick
         candidatos = [p for p in prontos if p is not executando]
         escolhido = escalonador.selecionar(candidatos, executando, agora)
@@ -434,6 +442,7 @@ def _motor_simulacao(processos: List[Processo], escalonador: "Escalonador",
         if escolhido is not executando:
             if executando is not None:
                 prontos.append(executando)
+                trocas_contexto += 1   # preempção ou bloqueio voluntário
             if escolhido in prontos:
                 prontos.remove(escolhido)
             executando = escolhido
@@ -483,7 +492,7 @@ def _motor_simulacao(processos: List[Processo], escalonador: "Escalonador",
 
         agora += 1
 
-    return concluidos, cpu_ociosa, agora, eventos
+    return concluidos, cpu_ociosa, trocas_contexto, historico_fila_io, agora, eventos
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -506,11 +515,16 @@ class Escalonador:
 
     def executar(self, processos: List[Processo], fs: SistemaArquivos) -> MetricasSistema:
         procs = copy.deepcopy(processos)
-        concluidos, cpu_ociosa, makespan, eventos = _motor_simulacao(procs, self, fs)
-        return self._calcular_metricas(concluidos, fs, makespan, eventos)
+        concluidos, cpu_ociosa, trocas_contexto, historico_fila_io, makespan, eventos = (
+            _motor_simulacao(procs, self, fs)
+        )
+        return self._calcular_metricas(concluidos, fs, makespan, eventos,
+                                        cpu_ociosa, trocas_contexto, historico_fila_io)
 
     def _calcular_metricas(self, procs: List[Processo], fs: SistemaArquivos,
-                            makespan: int, eventos: List[str]) -> MetricasSistema:
+                            makespan: int, eventos: List[str],
+                            cpu_ociosa: int = 0, trocas_contexto: int = 0,
+                            historico_fila_io: Optional[List[int]] = None) -> MetricasSistema:
         met = MetricasSistema(self.nome)
         n = len(procs)
         met.tempo_total_simulacao = makespan
@@ -518,6 +532,9 @@ class Escalonador:
         met.tempo_medio_retorno = sum(p.tempo_retorno for p in procs) / n if n else 0.0
         met.tempo_medio_resposta = sum(p.tempo_resposta for p in procs) / n if n else 0.0
         met.throughput = n / makespan if makespan else 0.0
+        met.trocas_contexto = trocas_contexto
+        met.utilizacao_cpu = (makespan - cpu_ociosa) / makespan if makespan else 0.0
+        met.historico_fila_io = historico_fila_io or []
 
         resumo = fs.resumo_metricas()
         met.latencia_media_io = resumo["latencia_media_io"]
@@ -560,6 +577,27 @@ class EscalonadorSJF(Escalonador):
         return min(prontos, key=lambda p: (p.proxima_rajada_cpu(), p.tempo_chegada, p.pid))
 
 
+class EscalonadorSRTF(Escalonador):
+    """Shortest Remaining Time First — variante preemptiva do SJF.
+
+    A cada tick avalia se existe um processo em 'prontos' com MENOS tempo
+    restante de CPU do que o processo atualmente em execução. Se sim,
+    preempta o atual. Isso fragmenta mais as rajadas de E/S do que o SJF
+    não-preemptivo — o que é interessante para comparar o impacto no cache.
+    """
+
+    def __init__(self):
+        super().__init__("SRTF (SJF Preemptivo)")
+
+    def selecionar(self, prontos, executando, agora):
+        candidatos = list(prontos)
+        if executando is not None:
+            candidatos.append(executando)
+        if not candidatos:
+            return None
+        return min(candidatos, key=lambda p: (p.proxima_rajada_cpu(), p.tempo_chegada, p.pid))
+
+
 class EscalonadorRoundRobin(Escalonador):
     """Round Robin preemptivo com quantum configurável."""
 
@@ -574,10 +612,26 @@ class EscalonadorRoundRobin(Escalonador):
 
 
 class EscalonadorPrioridade(Escalonador):
-    """Escalonamento por prioridade estática — preemptivo (reavalia a cada tick)."""
+    """Escalonamento por prioridade com envelhecimento (aging).
+
+    A prioridade efetiva de um processo decresce 1 nível a cada
+    INTERVALO_AGING ticks de espera acumulada. Isso evita starvation:
+    processos de baixa prioridade que esperam muito ficam progressivamente
+    mais competitivos, sem alterar a prioridade original do processo.
+
+    Continua preemptivo: a cada tick, se um processo com prioridade
+    efetiva menor (= mais urgente) aparecer na fila, ele toma a CPU.
+    """
+
+    INTERVALO_AGING = 10   # a cada 10 ticks de espera, sobe 1 nível de prioridade
 
     def __init__(self):
-        super().__init__("Prioridade (Preemptivo)")
+        super().__init__("Prioridade (Aging)")
+
+    def _prioridade_efetiva(self, p: "Processo") -> int:
+        """Quanto mais o processo esperou, menor (= mais urgente) a prioridade efetiva."""
+        bonus = p.tempo_espera // self.INTERVALO_AGING
+        return max(1, p.prioridade - bonus)
 
     def selecionar(self, prontos, executando, agora):
         candidatos = list(prontos)
@@ -585,7 +639,7 @@ class EscalonadorPrioridade(Escalonador):
             candidatos.append(executando)
         if not candidatos:
             return None
-        return min(candidatos, key=lambda p: (p.prioridade, p.tempo_chegada, p.pid))
+        return min(candidatos, key=lambda p: (self._prioridade_efetiva(p), p.tempo_chegada, p.pid))
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -684,6 +738,7 @@ def executar_simulacao(n_processos: int = 8, quantum_rr: int = 4,
     escalonadores: List[Escalonador] = [
         EscalonadorFCFS(),
         EscalonadorSJF(),
+        EscalonadorSRTF(),
         EscalonadorRoundRobin(quantum=quantum_rr),
         EscalonadorPrioridade(),
     ]
@@ -698,18 +753,20 @@ def executar_simulacao(n_processos: int = 8, quantum_rr: int = 4,
 
 def imprimir_tabela(resultados: List[MetricasSistema]):
     """Imprime tabela comparativa no terminal."""
-    print("\n" + "=" * 108)
-    print(f"{'ALGORITMO':<24} {'T.Esp':>7} {'T.Ret':>7} {'T.Resp':>7} {'Thrpt':>7} "
+    print("\n" + "=" * 122)
+    print(f"{'ALGORITMO':<26} {'T.Esp':>7} {'T.Ret':>7} {'T.Resp':>7} {'Thrpt':>7} {'CPU%':>6} {'Ctx':>5} "
           f"{'Lat.IO':>7} {'IO Ops':>7} {'Thrpt.IO':>9} {'Cache%':>7} {'Frag':>6} {'Starv':>6}")
-    print("=" * 108)
+    print("=" * 122)
     for m in resultados:
         starv = "SIM" if m.starvation_detectado else "NÃO"
         print(
-            f"{m.algoritmo:<24} "
+            f"{m.algoritmo:<26} "
             f"{m.tempo_medio_espera:>7.2f} "
             f"{m.tempo_medio_retorno:>7.2f} "
             f"{m.tempo_medio_resposta:>7.2f} "
             f"{m.throughput:>7.4f} "
+            f"{m.utilizacao_cpu * 100:>6.1f} "
+            f"{m.trocas_contexto:>5} "
             f"{m.latencia_media_io:>7.2f} "
             f"{m.total_io_operacoes:>7} "
             f"{m.throughput_io_kb:>9.2f} "
@@ -717,11 +774,11 @@ def imprimir_tabela(resultados: List[MetricasSistema]):
             f"{m.media_extents_por_arquivo:>6.2f} "
             f"{starv:>6}"
         )
-    print("=" * 108)
+    print("=" * 122)
     print("Legenda: T.Esp=Espera média (CPU) | T.Ret=Retorno médio | T.Resp=Resposta média")
-    print("         Thrpt=Throughput CPU (proc/t) | Lat.IO=Latência média de E/S")
-    print("         Thrpt.IO=Throughput de E/S (KB/t) | Cache%=Taxa de acerto de cache")
-    print("         Frag=Média de extents por arquivo (fragmentação; 1.0 = nenhuma)\n")
+    print("         Thrpt=Throughput CPU | CPU%=Utilização da CPU | Ctx=Trocas de contexto")
+    print("         Lat.IO=Latência média de E/S | Thrpt.IO=Throughput de E/S (KB/t)")
+    print("         Cache%=Taxa de acerto de cache | Frag=Extents médios por arquivo\n")
 
 
 if __name__ == "__main__":
