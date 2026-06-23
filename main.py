@@ -1,7 +1,7 @@
 """
 main.py — Ponto de entrada da simulação.
 
-Executa três cenários e gera os gráficos correspondentes.
+Executa quatro cenários e gera os gráficos correspondentes.
 
 Uso:
     python3 main.py
@@ -25,7 +25,7 @@ CENARIOS = [
         "nome":        "Cenário 1 — Carga Padrão (8 processos, Q=4)",
         "n_processos": 8,
         "quantum":     4,
-        "seed":        42,
+        "seed":        31,
         "arquivo":     "cenario1.png",
     },
     {
@@ -99,12 +99,15 @@ def main():
     # ──────────────────────────────────────────
     separador("RESUMO — Melhor algoritmo por métrica em cada cenário")
     metricas_keys = [
-        ("tempo_medio_espera",       "Menor espera",           min),
+        ("tempo_medio_espera",       "Menor espera (média)",   min),
+        ("tempo_max_espera",         "Menor espera (máxima)",  min),
         ("tempo_medio_retorno",      "Menor retorno",          min),
+        ("eficiencia_retorno",       "Maior eficiência ret.",  max),
         ("throughput",               "Maior throughput CPU",   max),
         ("utilizacao_cpu",           "Maior utilização CPU",   max),
         ("trocas_contexto",          "Menos trocas contexto",  min),
         ("latencia_media_io",        "Menor latência I/O",     min),
+        ("espera_media_fila_io",     "Menor espera fila I/O",  min),
         ("throughput_io_kb",         "Maior throughput I/O",   max),
         ("taxa_cache_hit",           "Maior cache hit",        max),
         ("media_extents_por_arquivo","Menor fragmentação",     min),

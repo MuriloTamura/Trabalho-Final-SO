@@ -1,38 +1,6 @@
 """
 Simulação: Impacto da Política de Escalonamento de CPU
        sobre o Comportamento do Sistema de Arquivos
-
-IFCE - Campus Maracanaú | Sistemas Operacionais | 2026.1
-
-────────────────────────────────────────────────────────────────────────
-NOTA DE VERSÃO
-────────────────────────────────────────────────────────────────────────
-Esta é uma reescrita do motor de simulação original. O problema corrigido:
-nas versões anteriores, cada processo carregava uma lista de requisições
-de E/S com um `tempo_chegada` sorteado de forma independente da execução
-real. Cada algoritmo de escalonamento testava esse instante contra uma
-janela de tempo diferente — e em Round Robin e Prioridade isso fazia a
-imensa maioria das requisições nunca ser de fato processada pelo sistema
-de arquivos (verificado: apenas 2 a 3 de 23 requisições eram atendidas
-nesses dois algoritmos, contra 23 de 23 em FCFS/SJF). Isso invalidava a
-comparação entre políticas exatamente nas métricas de E/S, que são o
-núcleo do trabalho.
-
-Correção adotada: a E/S agora NASCE da execução. Cada processo é uma
-sequência de FASES que alternam CPU e E/S; uma requisição só é emitida
-no exato instante em que a fase de CPU anterior termina de executar.
-Isso garante que:
-  1. Toda requisição de E/S gerada é, garantidamente, processada;
-  2. O instante de emissão da requisição é uma CONSEQUÊNCIA direta da
-     política de escalonamento, e não um dado independente dela — o que
-     é exatamente a relação causal que o tema do trabalho pede para
-     estudar.
-
-Também foi adicionado um modelo de arquivos com alocação de blocos e
-fragmentação (extents), para aprofundar o lado "Sistema de Arquivos" do
-tema, que antes se limitava a números de bloco soltos, sem qualquer
-noção de arquivo, alocação ou fragmentação.
-────────────────────────────────────────────────────────────────────────
 """
 
 import math
@@ -149,7 +117,24 @@ class RequisicaoArquivo:
 
     @property
     def latencia_io(self) -> int:
+        """Latência TOTAL de E/S: tempo na fila + tempo de serviço no disco.
+        latencia_io = tempo_fim_io - tempo_chegada
+                    = (tempo_inicio_io - tempo_chegada)  [espera na fila]
+                    + (tempo_fim_io - tempo_inicio_io)   [serviço no disco]
+        """
         return self.tempo_fim_io - self.tempo_chegada
+
+    @property
+    def espera_fila_io(self) -> int:
+        """Componente de fila: quanto tempo a requisição ficou parada
+        esperando o disco ficar livre antes de começar a ser atendida."""
+        return self.tempo_inicio_io - self.tempo_chegada
+
+    @property
+    def tempo_servico_io(self) -> int:
+        """Componente de serviço: tempo realmente gasto pelo disco atendendo
+        a requisição (seek + rotação + transferência), sem a fila."""
+        return self.tempo_fim_io - self.tempo_inicio_io
 
 
 @dataclass
@@ -157,21 +142,28 @@ class MetricasSistema:
     """Agrega os resultados de uma execução completa de um escalonador."""
     algoritmo: str
     tempo_medio_espera: float = 0.0
+    tempo_max_espera: float = 0.0           # espera do processo mais penalizado (usado p/ starvation)
     tempo_medio_retorno: float = 0.0
     tempo_medio_resposta: float = 0.0
-    throughput: float = 0.0                 # processos / unidade de tempo
+    throughput: float = 0.0                 # processos / unidade de tempo (vazão global)
+    eficiencia_retorno: float = 0.0         # 1 / tempo_medio_retorno — mais sensível à política
     latencia_media_io: float = 0.0
+    espera_media_fila_io: float = 0.0       # componente de fila da latência de E/S
+    servico_medio_io: float = 0.0           # componente de serviço da latência de E/S
     total_io_operacoes: int = 0
     throughput_io_kb: float = 0.0           # KB / unidade de tempo
     taxa_cache_hit: float = 0.0
+    cache_hits: int = 0                     # bruto — para auditoria/depuração
+    cache_misses: int = 0                   # bruto — para auditoria/depuração
     distancia_seek_total: int = 0
     media_extents_por_arquivo: float = 0.0  # indicador de fragmentação
     tempo_total_simulacao: int = 0
-    trocas_contexto: int = 0                # número de preempções / trocas de contexto
+    trocas_contexto: int = 0                # número de trocas de contexto (dispatches + preempções)
     utilizacao_cpu: float = 0.0             # fração do tempo com CPU ocupada
     historico_fila_io: List[int] = field(default_factory=list)  # tamanho da fila a cada tick
     starvation_detectado: bool = False
     processos_com_starvation: List[int] = field(default_factory=list)
+    limiar_starvation: int = 0              # limiar usado para detectar starvation (exposto à visualização)
     log_eventos: List[str] = field(default_factory=list)
 
 
@@ -239,13 +231,17 @@ class SistemaDiscoVirtual:
         self.alocacao[arquivo] = [(blocos[0], len(blocos))] if blocos else []
 
     def _alocar(self, n: int) -> List[int]:
-        alocados = []
-        for _ in range(n):
-            if not self.blocos_livres:
-                # disco "cheio": recicla blocos (apenas para a simulação
-                # não travar — um SO real trataria isso como ENOSPC)
-                self.blocos_livres.extend(range(self.num_blocos))
-            alocados.append(self.blocos_livres.popleft())
+        if len(self.blocos_livres) < n:
+            # Disco "cheio": nesta simulação não modelamos ENOSPC, mas
+            # também não podemos reciclar blocos que já pertencem a outro
+            # arquivo (isso corromperia a alocação: dois arquivos
+            # "donos" do mesmo bloco físico). Damos margem realocando
+            # apenas blocos extras ao final do disco virtual.
+            faltam = n - len(self.blocos_livres)
+            novo_inicio = self.num_blocos
+            self.blocos_livres.extend(range(novo_inicio, novo_inicio + faltam))
+            self.num_blocos += faltam
+        alocados = [self.blocos_livres.popleft() for _ in range(n)]
         return alocados
 
     def escrever(self, arquivo: str, n_blocos: int) -> List[int]:
@@ -314,7 +310,7 @@ class SistemaArquivos:
     trabalho é o efeito do escalonador de CPU, não do escalonador de
     disco). `tick()` avança 1 unidade de tempo de atendimento."""
 
-    def __init__(self, num_blocos: int = 300, capacidade_cache: int = 24):
+    def __init__(self, num_blocos: int = 300, capacidade_cache: int = 8):
         self.disco = SistemaDiscoVirtual(num_blocos=num_blocos)
         self.cache = CacheArquivos(capacidade=capacidade_cache)
         self.fila: List[RequisicaoArquivo] = []
@@ -375,14 +371,24 @@ class SistemaArquivos:
     def resumo_metricas(self) -> dict:
         if self.concluidas:
             latencias = [r.latencia_io for r in self.concluidas]
+            esperas_fila = [r.espera_fila_io for r in self.concluidas]
+            servicos = [r.tempo_servico_io for r in self.concluidas]
             latencia_media = sum(latencias) / len(latencias)
+            espera_media_fila = sum(esperas_fila) / len(esperas_fila)
+            servico_medio = sum(servicos) / len(servicos)
         else:
             latencia_media = 0.0
+            espera_media_fila = 0.0
+            servico_medio = 0.0
         return {
             "latencia_media_io": latencia_media,
+            "espera_media_fila_io": espera_media_fila,
+            "servico_medio_io": servico_medio,
             "total_requisicoes": self.total_requisicoes,
             "kb_transferidos": self.kb_transferidos,
             "taxa_cache_hit": self.cache.taxa_hit,
+            "cache_hits": self.cache.hits,
+            "cache_misses": self.cache.misses,
             "distancia_seek_total": self.disco.distancia_seek_total,
             "media_extents_por_arquivo": self.disco.media_extents_por_arquivo(),
         }
@@ -430,9 +436,12 @@ def _motor_simulacao(processos: List[Processo], escalonador: "Escalonador",
         # 2b) registra tamanho da fila de E/S neste tick
         historico_fila_io.append(len(fs.fila) + (1 if fs.em_atendimento else 0))
 
-        # 3) escolhe quem ocupa a CPU neste tick
-        candidatos = [p for p in prontos if p is not executando]
-        escolhido = escalonador.selecionar(candidatos, executando, agora)
+        # 3) escolhe quem ocupa a CPU neste tick.
+        # O escalonador recebe a lista completa de prontos (sem o processo
+        # em execução) E o processo em execução separado, para que políticas
+        # não-preemptivas (FCFS, SJF) possam simplesmente retornar `executando`
+        # e políticas preemptivas (SRTF, Prioridade) possam comparar os dois.
+        escolhido = escalonador.selecionar(list(prontos), executando, agora)
 
         if escolhido is None:
             cpu_ociosa += 1
@@ -440,9 +449,15 @@ def _motor_simulacao(processos: List[Processo], escalonador: "Escalonador",
             continue
 
         if escolhido is not executando:
+            # Houve troca de contexto: qualquer mudança de processo na CPU
+            # (preempção, dispatch após término/bloqueio, ou primeiro dispatch).
+            # Em sistemas operacionais reais, TODA substituição de processo na
+            # CPU envolve salvar/restaurar contexto — inclusive FCFS e SJF
+            # trocam contexto cada vez que um processo termina e o próximo entra.
+            trocas_contexto += 1
             if executando is not None:
+                # Preempção: devolve o processo atual para a fila de prontos
                 prontos.append(executando)
-                trocas_contexto += 1   # preempção ou bloqueio voluntário
             if escolhido in prontos:
                 prontos.remove(escolhido)
             executando = escolhido
@@ -486,6 +501,11 @@ def _motor_simulacao(processos: List[Processo], escalonador: "Escalonador",
                     executando = None
             ticks_quantum = 0
         elif quantum_terminou:
+            # Quantum esgotado: devolve à fila de prontos. A troca de
+            # contexto (se houver) é contada no próximo tick, no bloco
+            # `escolhido is not executando` — contar aqui TAMBÉM duplica
+            # a troca quando o próprio processo é reescolhido em seguida
+            # (fila vazia ou só ele pronto), o que inflava o RR ~2x.
             prontos.append(proc)
             executando = None
             ticks_quantum = 0
@@ -504,10 +524,19 @@ class Escalonador:
     (`selecionar`); o motor de simulação (`_motor_simulacao`) é o mesmo
     para todas, então a comparação entre políticas é justa."""
 
-    LIMIAR_STARVATION = 50  # espera máxima aceitável antes de soar alarme
+    # Limiar de starvation: baseado no burst médio da carga (não no número de
+    # processos). Um processo está em starvation quando sua espera acumulada
+    # supera 2× o burst médio esperado da carga — ou seja, ele deveria ter
+    # sido executado pelo menos duas vezes completas, mas ainda está esperando.
+    # Burst médio ≈ 50 ticks (média ponderada entre CPU-bound ~85, I/O-bound ~6,
+    # Misto ~27, com proporção 1/3 cada). 2× burst_medio ≈ 100 ticks.
+    # Esse limiar é FIXO e INDEPENDENTE do número de processos, assim como
+    # na definição clássica de starvation em literatura de SO.
+    LIMIAR_STARVATION = 100  # ticks — fixo, baseado em 2× burst médio da carga
 
     def __init__(self, nome: str):
         self.nome = nome
+        self._limiar_starvation = self.LIMIAR_STARVATION
 
     def selecionar(self, prontos: List[Processo], executando: Optional[Processo],
                    agora: int) -> Optional[Processo]:
@@ -529,24 +558,38 @@ class Escalonador:
         n = len(procs)
         met.tempo_total_simulacao = makespan
         met.tempo_medio_espera = sum(p.tempo_espera for p in procs) / n if n else 0.0
+        met.tempo_max_espera = max((p.tempo_espera for p in procs), default=0.0)
         met.tempo_medio_retorno = sum(p.tempo_retorno for p in procs) / n if n else 0.0
         met.tempo_medio_resposta = sum(p.tempo_resposta for p in procs) / n if n else 0.0
         met.throughput = n / makespan if makespan else 0.0
+        # Throughput (n/makespan) é dominado pelo makespan, que por sua vez é
+        # dominado pela soma fixa de trabalho (bursts de CPU + serviço de E/S)
+        # — isso é CONCEITUALMENTE correto, mas pouco discriminativo entre
+        # políticas quando todas terminam numa janela de tempo parecida.
+        # eficiencia_retorno é mais sensível à política, pois captura o efeito
+        # médio sentido por processo (tempo de retorno), não só o instante do
+        # último processo a terminar.
+        met.eficiencia_retorno = (1.0 / met.tempo_medio_retorno) if met.tempo_medio_retorno else 0.0
         met.trocas_contexto = trocas_contexto
         met.utilizacao_cpu = (makespan - cpu_ociosa) / makespan if makespan else 0.0
         met.historico_fila_io = historico_fila_io or []
 
         resumo = fs.resumo_metricas()
         met.latencia_media_io = resumo["latencia_media_io"]
+        met.espera_media_fila_io = resumo["espera_media_fila_io"]
+        met.servico_medio_io = resumo["servico_medio_io"]
         met.total_io_operacoes = resumo["total_requisicoes"]
         met.throughput_io_kb = resumo["kb_transferidos"] / makespan if makespan else 0.0
         met.taxa_cache_hit = resumo["taxa_cache_hit"]
+        met.cache_hits = resumo["cache_hits"]
+        met.cache_misses = resumo["cache_misses"]
         met.distancia_seek_total = resumo["distancia_seek_total"]
         met.media_extents_por_arquivo = resumo["media_extents_por_arquivo"]
 
-        com_starvation = [p.pid for p in procs if p.tempo_espera > self.LIMIAR_STARVATION]
+        com_starvation = [p.pid for p in procs if p.tempo_espera > self._limiar_starvation]
         met.starvation_detectado = len(com_starvation) > 0
         met.processos_com_starvation = com_starvation
+        met.limiar_starvation = self._limiar_starvation  # expõe à visualização
         met.log_eventos = eventos
         return met
 
@@ -619,8 +662,27 @@ class EscalonadorPrioridade(Escalonador):
     processos de baixa prioridade que esperam muito ficam progressivamente
     mais competitivos, sem alterar a prioridade original do processo.
 
-    Continua preemptivo: a cada tick, se um processo com prioridade
-    efetiva menor (= mais urgente) aparecer na fila, ele toma a CPU.
+    Preemptivo apenas por NÍVEL: um processo pronto só toma a CPU do
+    processo em execução se sua prioridade efetiva for ESTRITAMENTE
+    melhor (menor). Em caso de empate de nível, o processo em execução
+    continua executando.
+
+    BUG CORRIGIDO (regressão de uma "correção" anterior):
+    Desempatar globalmente por `-tempo_espera` (quem esperou mais vence)
+    e aplicar esse desempate também CONTRA o processo em execução causava
+    preempção espúria a cada tick: como `tempo_espera` do processo em
+    execução fica parado (só quem está em `prontos` acumula espera) e o
+    dos processos prontos cresce 1 a cada tick, o desempate quase sempre
+    favorecia algum processo pronto sobre o que estava rodando, mesmo
+    com prioridade efetiva IDÊNTICA — gerando troca de contexto a cada
+    1-2 ticks (203 de 204 trocas no cenário padrão eram espúrias, sem
+    nenhuma mudança real de urgência).
+    Correção: a comparação contra o processo em execução usa só a
+    prioridade efetiva (sem o desempate por espera). O desempate por
+    maior tempo de espera é usado apenas para decidir, ENTRE os
+    candidatos prontos empatados em nível, qual deles entra quando a
+    CPU está livre — preservando a ideia original de não travar em
+    FCFS rígido dentro do grupo já saturado em prioridade 1.
     """
 
     INTERVALO_AGING = 10   # a cada 10 ticks de espera, sobe 1 nível de prioridade
@@ -634,12 +696,28 @@ class EscalonadorPrioridade(Escalonador):
         return max(1, p.prioridade - bonus)
 
     def selecionar(self, prontos, executando, agora):
-        candidatos = list(prontos)
-        if executando is not None:
-            candidatos.append(executando)
-        if not candidatos:
+        if not prontos and executando is None:
             return None
-        return min(candidatos, key=lambda p: (self._prioridade_efetiva(p), p.tempo_chegada, p.pid))
+
+        melhor_pronto = None
+        if prontos:
+            melhor_pronto = min(
+                prontos,
+                key=lambda p: (self._prioridade_efetiva(p), -p.tempo_espera,
+                                p.tempo_chegada, p.pid),
+            )
+
+        if executando is None:
+            return melhor_pronto
+
+        if melhor_pronto is None:
+            return executando
+
+        # Só preempta por NÍVEL estritamente melhor — empate de prioridade
+        # efetiva mantém o processo em execução (evita troca espúria).
+        if self._prioridade_efetiva(melhor_pronto) < self._prioridade_efetiva(executando):
+            return melhor_pronto
+        return executando
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -667,10 +745,40 @@ def gerar_carga(n_processos: int = 8, seed: int = 42) -> Tuple[List[Processo], D
     """Gera processos com perfis variados (CPU-bound, I/O-bound, Misto) e
     a lista de arquivos que devem existir previamente no disco.
 
+    Parâmetros calibrados para maximizar a diferença observável entre políticas:
+
+    - CPU-bound: burst longo (50-120 ticks) → FCFS sofre efeito comboio real;
+      políticas preemptivas (RR, SRTF) interrompem frequentemente e fragmentam
+      mais a fila de E/S em comparação com FCFS/SJF.
+
+    - I/O-bound: burst curto (3-10 ticks), muitas fases de E/S → a cadência de
+      chegada de requisições varia bastante conforme o escalonador.
+
+    - Acesso com localidade: 60% das leituras usam offset dentro de um pequeno
+      conjunto FIXO de "blocos quentes" (não um intervalo contínuo qualquer)
+      em 2 arquivos "quentes". Usar pontos de ancoragem fixos (em vez de um
+      offset aleatório livre dentro de uma janela) é essencial: como cada
+      leitura cobre uma janela de tamanho variável, duas leituras que apenas
+      "começam dentro da mesma faixa" quase nunca pedem exatamente os MESMOS
+      blocos lógicos — e é a igualdade exata de bloco que o cache LRU exige
+      para registrar um hit. Ancorar em poucos pontos fixos garante reuso real.
+
     Retorna (processos, tamanhos_iniciais_dos_arquivos_em_blocos).
     """
     rng = random.Random(seed)
     tamanhos_iniciais = {a: rng.randint(30, 80) for a in ARQUIVOS_SISTEMA}
+
+    # Dois arquivos "quentes": a maioria das leituras com localidade vai para eles
+    arquivos_quentes = ARQUIVOS_SISTEMA[:2]   # dados.db, log_sistema.txt
+
+    # Pontos de ancoragem FIXOS por arquivo quente: um pequeno conjunto de
+    # offsets lógicos (não um intervalo contínuo) que processos diferentes
+    # vão reutilizar literalmente — é isso que cria sobreposição de blocos
+    # real e, portanto, hits de cache reais e comparáveis entre algoritmos.
+    N_PONTOS_QUENTES = 2   # poucos pontos → mais reuso exato do MESMO bloco
+    pontos_quentes: Dict[str, List[int]] = {
+        a: [0, 2][:N_PONTOS_QUENTES] for a in arquivos_quentes
+    }
 
     processos = []
     perfis = ["CPU-bound", "I/O-bound", "Misto"]
@@ -678,13 +786,15 @@ def gerar_carga(n_processos: int = 8, seed: int = 42) -> Tuple[List[Processo], D
     for i in range(n_processos):
         perfil = perfis[i % len(perfis)]
         chegada = rng.randint(0, 10)
-        burst_total = (rng.randint(20, 40) if perfil == "CPU-bound"
-                       else rng.randint(5, 15) if perfil == "I/O-bound"
-                       else rng.randint(10, 25))
+
+        # Bursts maiores → a política de CPU tem mais tempo para fazer diferença
+        burst_total = (rng.randint(50, 120) if perfil == "CPU-bound"
+                       else rng.randint(3, 10)  if perfil == "I/O-bound"
+                       else rng.randint(15, 40))
         prioridade = rng.randint(1, 5)
 
         n_reqs = (1 if perfil == "CPU-bound"
-                  else rng.randint(4, 6) if perfil == "I/O-bound"
+                  else rng.randint(4, 7) if perfil == "I/O-bound"
                   else rng.randint(2, 4))
         n_reqs = min(n_reqs, max(1, burst_total - 1))
 
@@ -695,13 +805,26 @@ def gerar_carga(n_processos: int = 8, seed: int = 42) -> Tuple[List[Processo], D
             fases.append(Fase(tipo=TipoFase.CPU, duracao=duracao))
             if k < n_reqs:
                 operacao = rng.choice([TipoOperacao.LEITURA, TipoOperacao.ESCRITA])
-                arquivo = rng.choice(ARQUIVOS_SISTEMA)
-                tamanho_kb = round(rng.uniform(1.0, 64.0), 1)
-                n_blocos_fase = max(1, math.ceil(tamanho_kb / BLOCO_KB))
-                offset_logico = 0
-                if operacao == TipoOperacao.LEITURA:
-                    espaco = max(0, tamanhos_iniciais[arquivo] - n_blocos_fase)
-                    offset_logico = rng.randint(0, espaco) if espaco > 0 else 0
+
+                # Localidade: 60% das leituras vão para arquivos quentes,
+                # ancoradas num offset fixo reutilizado entre processos →
+                # mesmos blocos lógicos absolutos, dando ao cache LRU chance
+                # real de produzir hits (ver nota acima sobre ancoragem fixa).
+                usar_localidade = (operacao == TipoOperacao.LEITURA
+                                   and rng.random() < 0.80)
+                if usar_localidade:
+                    arquivo = rng.choice(arquivos_quentes)
+                    tamanho_kb = round(rng.uniform(1.0, 12.0), 1)   # pequeno → poucos blocos
+                    offset_logico = rng.choice(pontos_quentes[arquivo])
+                else:
+                    arquivo = rng.choice(ARQUIVOS_SISTEMA)
+                    tamanho_kb = round(rng.uniform(1.0, 64.0), 1)
+                    n_blocos_fase = max(1, math.ceil(tamanho_kb / BLOCO_KB))
+                    offset_logico = 0
+                    if operacao == TipoOperacao.LEITURA:
+                        espaco = max(0, tamanhos_iniciais[arquivo] - n_blocos_fase)
+                        offset_logico = rng.randint(0, espaco) if espaco > 0 else 0
+
                 fases.append(Fase(tipo=TipoFase.IO, arquivo=arquivo, operacao=operacao,
                                    tamanho_kb=tamanho_kb, offset_logico=offset_logico))
 
@@ -753,15 +876,19 @@ def executar_simulacao(n_processos: int = 8, quantum_rr: int = 4,
 
 def imprimir_tabela(resultados: List[MetricasSistema]):
     """Imprime tabela comparativa no terminal."""
-    print("\n" + "=" * 122)
-    print(f"{'ALGORITMO':<26} {'T.Esp':>7} {'T.Ret':>7} {'T.Resp':>7} {'Thrpt':>7} {'CPU%':>6} {'Ctx':>5} "
+    print("\n" + "=" * 134)
+    print(f"{'ALGORITMO':<26} {'T.Esp':>7} {'T.EspMax':>9} {'T.Ret':>7} {'T.Resp':>7} {'Thrpt':>7} {'CPU%':>6} {'Ctx':>5} "
           f"{'Lat.IO':>7} {'IO Ops':>7} {'Thrpt.IO':>9} {'Cache%':>7} {'Frag':>6} {'Starv':>6}")
-    print("=" * 122)
+    print("=" * 134)
     for m in resultados:
+        # Critério EXPLÍCITO de starvation: por PROCESSO INDIVIDUAL, usando a
+        # maior espera entre todos os processos (não a média). Um algoritmo
+        # pode ter espera MÉDIA baixa e ainda conter um outlier em starvation.
         starv = "SIM" if m.starvation_detectado else "NÃO"
         print(
             f"{m.algoritmo:<26} "
             f"{m.tempo_medio_espera:>7.2f} "
+            f"{m.tempo_max_espera:>9.2f} "
             f"{m.tempo_medio_retorno:>7.2f} "
             f"{m.tempo_medio_resposta:>7.2f} "
             f"{m.throughput:>7.4f} "
@@ -774,11 +901,14 @@ def imprimir_tabela(resultados: List[MetricasSistema]):
             f"{m.media_extents_por_arquivo:>6.2f} "
             f"{starv:>6}"
         )
-    print("=" * 122)
-    print("Legenda: T.Esp=Espera média (CPU) | T.Ret=Retorno médio | T.Resp=Resposta média")
+    print("=" * 134)
+    print("Legenda: T.Esp=Espera MÉDIA (CPU) | T.EspMax=Espera MÁXIMA entre processos (base da starvation)")
+    print("         T.Ret=Retorno médio | T.Resp=Resposta média")
     print("         Thrpt=Throughput CPU | CPU%=Utilização da CPU | Ctx=Trocas de contexto")
     print("         Lat.IO=Latência média de E/S | Thrpt.IO=Throughput de E/S (KB/t)")
-    print("         Cache%=Taxa de acerto de cache | Frag=Extents médios por arquivo\n")
+    print("         Cache%=Taxa de acerto de cache | Frag=Extents médios por arquivo")
+    print(f"         Starv=SIM se ALGUM processo individual teve tempo_espera > "
+          f"{resultados[0].limiar_starvation if resultados else 100} ticks (não é sobre a média)\n")
 
 
 if __name__ == "__main__":

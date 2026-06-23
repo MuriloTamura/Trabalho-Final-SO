@@ -38,7 +38,7 @@ O repositório está organizado de forma modular para separar a lógica de simul
 * **Linguagem:** Python 3 (100%)
 * **Análise de Dados e Gráficos:** `matplotlib` / `seaborn` (utilizados para a estruturação dos painéis visuais).
 
----
+ ---
 
 ## 🚀 Como Executar
 

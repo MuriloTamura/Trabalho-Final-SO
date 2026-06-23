@@ -5,7 +5,7 @@ Módulo de visualização — gera gráficos comparativos entre os algoritmos.
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
-from simulacao import executar_simulacao, MetricasSistema
+from simulacao import executar_simulacao, MetricasSistema  # usa simulacao.py do mesmo diretório
 from typing import List
 
 
@@ -15,8 +15,8 @@ from typing import List
 
 CORES = {
     "FCFS":                      "#2563EB",
-    "SJF":                       "#16A34A",
     "SRTF":                      "#0891B2",
+    "SJF":                       "#16A34A",
     "Round Robin":               "#D97706",
     "Prioridade":                "#DC2626",
 }
@@ -35,6 +35,13 @@ plt.rcParams.update({
 
 
 def _cor(algoritmo: str) -> str:
+    # BUG CORRIGIDO: o nome completo do escalonador é
+    # "SRTF (SJF Preemptivo)", que contém a substring "SJF". Com "SJF"
+    # testado ANTES de "SRTF" no dict (ordem de inserção), toda chamada
+    # para SRTF caía no `"SJF" in algoritmo` primeiro e retornava a cor
+    # do SJF — por isso SRTF aparecia pintado igual ao SJF em todos os
+    # gráficos. Corrigido reordenando CORES para testar "SRTF" antes de
+    # "SJF" (chave mais específica primeiro).
     for k, v in CORES.items():
         if k in algoritmo:
             return v
@@ -90,15 +97,25 @@ def grafico_cpu(resultados: List[MetricasSistema], ax_espera, ax_retorno, ax_thr
         ax_retorno.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
                         f"{v:.1f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
 
-    # Throughput
+    # Throughput global (processos / makespan) — ver nota técnica: esta
+    # métrica é pouco discriminativa quando o makespan é dominado pela carga
+    # de trabalho fixa, não pela política. Por isso some-se a eficiência de
+    # retorno (1/tempo_médio_retorno) como segunda linha no rótulo de cada
+    # barra: ela reage de forma mais visível às diferenças entre algoritmos.
     vals = [m.throughput for m in resultados]
+    vals_efic = [m.eficiencia_retorno for m in resultados]
     bars = ax_throughput.bar(x, vals, width, color=cores, edgecolor="white", linewidth=1.5)
-    ax_throughput.set_title("Throughput (proc / unidade de tempo)", fontweight="bold", fontsize=11)
+    ax_throughput.set_title("Throughput CPU (barra) vs\nEficiência de Retorno 1/T.Ret (itálico)",
+                              fontweight="bold", fontsize=10)
     ax_throughput.set_ylabel("proc / t")
     ax_throughput.set_xticks(x); ax_throughput.set_xticklabels(nomes)
-    for bar, v in zip(bars, vals):
-        ax_throughput.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.0005,
+    ax_throughput.set_ylim(0, max(vals) * 1.35 if vals else 1)
+    for bar, v, ve in zip(bars, vals, vals_efic):
+        ax_throughput.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(vals) * 0.02,
                            f"{v:.4f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
+        ax_throughput.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(vals) * 0.10,
+                           f"({ve:.4f})", ha="center", va="bottom", fontsize=7.5, style="italic",
+                           color="#374151")
 
 
 # ──────────────────────────────────────────────
@@ -111,15 +128,24 @@ def grafico_io(resultados, ax_latencia, ax_throughput_io, ax_cache):
     x     = np.arange(len(resultados))
     width = 0.55
 
-    # Latência de I/O
-    vals = [m.latencia_media_io for m in resultados]
-    bars = ax_latencia.bar(x, vals, width, color=cores, edgecolor="white", linewidth=1.5)
-    ax_latencia.set_title("Latência Média de I/O", fontweight="bold", fontsize=11)
+    # Latência de I/O — decomposta em espera de fila (disco ocupado) + serviço
+    # (seek + rotação + transferência), para deixar visível POR QUE algoritmos
+    # com menor espera de CPU podem ter maior latência de I/O: eles geram ondas
+    # de requisições mais simultâneas, que saturam o único braço de disco.
+    vals_fila    = [m.espera_media_fila_io for m in resultados]
+    vals_servico = [m.servico_medio_io for m in resultados]
+    bars_fila = ax_latencia.bar(x, vals_fila, width, color=cores, edgecolor="white",
+                                 linewidth=1.5, alpha=0.55, hatch="//", label="Espera na fila")
+    bars_serv = ax_latencia.bar(x, vals_servico, width, bottom=vals_fila, color=cores,
+                                 edgecolor="white", linewidth=1.5, label="Serviço (seek+rot+transf.)")
+    ax_latencia.set_title("Latência Média de I/O\n(fila + serviço)", fontweight="bold", fontsize=11)
     ax_latencia.set_ylabel("Unidades de tempo")
     ax_latencia.set_xticks(x); ax_latencia.set_xticklabels(nomes)
-    for bar, v in zip(bars, vals):
-        ax_latencia.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1,
-                         f"{v:.1f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
+    ax_latencia.legend(fontsize=6.5, loc="upper left")
+    for i, (vf, vs) in enumerate(zip(vals_fila, vals_servico)):
+        total = vf + vs
+        ax_latencia.text(x[i], total + 0.1, f"{total:.1f}", ha="center", va="bottom",
+                         fontsize=9, fontweight="bold")
 
     # Throughput de I/O (KB/t)
     vals = [m.throughput_io_kb for m in resultados]
@@ -264,26 +290,83 @@ def grafico_overhead(resultados: List[MetricasSistema], ax_frag, ax_ctx, ax_util
 
 
 def grafico_starvation(resultados, ax):
+    """
+    BUG CORRIGIDO — cor da barra desalinhada do que ela representa:
+    Na versão anterior, a barra ia de 0 até a MÉDIA e era pintada de
+    vermelho inteira quando havia starvation. Como o critério de
+    starvation é a MÁXIMA individual (losango), não a média, isso
+    produzia barras vermelhas que terminavam BEM ANTES do limiar
+    (ex.: SRTF com média 25.8 pintada vermelha, losango da máxima a
+    123.0 — bem mais à direita, fora da barra) — visualmente parece
+    "a barra errada foi marcada", embora a flag em si estivesse correta.
+
+    Correção: a barra agora desenha o intervalo COMPLETO de espera de
+    cada algoritmo, da média até a máxima individual (não só até a
+    média). O trecho até a média usa a cor do algoritmo; o trecho de
+    média até máxima é desenhado em hachura. Só a fração da barra que
+    está de fato ACIMA do limiar de starvation é pintada em vermelho —
+    assim a área vermelha e o losango da máxima sempre coincidem, e a
+    barra nunca "termina" antes do ponto que motivou a marcação.
+    """
     nomes  = _nomes_curtos(resultados)
     esperas = [m.tempo_medio_espera for m in resultados]
-    limiar  = 50  # mesmo da simulação
+    esperas_max = [m.tempo_max_espera for m in resultados]
 
-    cores_barras = []
-    for m in resultados:
-        cores_barras.append("#DC2626" if m.starvation_detectado else _cor(m.algoritmo))
+    limiar = resultados[0].limiar_starvation if resultados else 100
 
-    bars = ax.barh(nomes, esperas, color=cores_barras, edgecolor="white", linewidth=1.5, height=0.5)
-    ax.axvline(x=limiar, color="#DC2626", linestyle="--", linewidth=1.5, label=f"Limiar starvation ({limiar})")
-    ax.set_title("Tempo Médio de Espera & Starvation", fontweight="bold", fontsize=11)
+    y = np.arange(len(resultados))
+    altura = 0.5
+
+    for yi, m, v, vmax in zip(y, resultados, esperas, esperas_max):
+        cor_base = _cor(m.algoritmo)
+        # 1) trecho 0 -> média: cor do algoritmo (ou vermelho se a própria
+        #    média já superou o limiar)
+        cor_media = "#DC2626" if v > limiar else cor_base
+        ax.barh(yi, v, height=altura, color=cor_media, edgecolor="white", linewidth=1.5, zorder=2)
+        # 2) trecho média -> máxima: hachurado, mesma lógica de cor por
+        #    segmento (abaixo do limiar = cor do algoritmo, acima = vermelho)
+        if vmax > v:
+            if v >= limiar:
+                ax.barh(yi, vmax - v, left=v, height=altura, color="#DC2626",
+                        edgecolor="white", linewidth=1.0, hatch="//", alpha=0.55, zorder=2)
+            elif vmax > limiar:
+                # o segmento cruza o limiar: parte cor base, parte vermelha
+                ax.barh(yi, limiar - v, left=v, height=altura, color=cor_base,
+                        edgecolor="white", linewidth=1.0, hatch="//", alpha=0.55, zorder=2)
+                ax.barh(yi, vmax - limiar, left=limiar, height=altura, color="#DC2626",
+                        edgecolor="white", linewidth=1.0, hatch="//", alpha=0.55, zorder=2)
+            else:
+                ax.barh(yi, vmax - v, left=v, height=altura, color=cor_base,
+                        edgecolor="white", linewidth=1.0, hatch="//", alpha=0.55, zorder=2)
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(nomes)
+    ax.invert_yaxis()  # mantém a mesma ordem de cima->baixo da versão anterior (barh inverte por padrão)
+
+    # Marcador da espera MÁXIMA individual — é ela, não a média, que decide
+    # starvation. Agora ele cai sempre na ponta da barra (fim do hachurado).
+    ax.scatter(esperas_max, y, marker="D", s=55, color="#1F2937", zorder=5,
+               label="Espera MÁXIMA individual (decide starvation)")
+    ax.axvline(x=limiar, color="#DC2626", linestyle="--", linewidth=1.5,
+               label=f"Limiar starvation ({limiar} ticks)")
+    ax.set_title("Tempo Médio de Espera & Starvation\n"
+                  "(barra sólida = média | hachura = intervalo até a máxima | vermelho = trecho acima do limiar)",
+                  fontweight="bold", fontsize=11)
     ax.set_xlabel("Unidades de tempo")
 
-    for bar, m, v in zip(bars, resultados, esperas):
-        label = f"{v:.1f}" + (" ⚠ STARVATION" if m.starvation_detectado else "")
-        ax.text(bar.get_width() + 0.5, bar.get_y() + bar.get_height() / 2,
+    # Reserva margem suficiente no eixo X para o texto do rótulo não ser
+    # cortado/sobreposto na borda direita (ver nota de correção anterior).
+    maior_valor = max(esperas_max + esperas + [limiar])
+    margem = maior_valor * 0.55
+    ax.set_xlim(0, maior_valor + margem)
+
+    for yi, m, v, vmax in zip(y, resultados, esperas, esperas_max):
+        label = f"méd {v:.1f} / máx {vmax:.1f}" + (" ⚠ STARVATION" if m.starvation_detectado else "")
+        ax.text(max(v, vmax) + maior_valor * 0.015, yi,
                 label, va="center", fontsize=9, fontweight="bold",
                 color="#DC2626" if m.starvation_detectado else "#1F2937")
 
-    ax.legend(fontsize=9)
+    ax.legend(fontsize=8, loc="lower right")
 
 
 # ──────────────────────────────────────────────
